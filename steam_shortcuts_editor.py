@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QListWidget, QFrame, QScrollArea, QPushButton,
+    QLabel, QListView, QFrame, QScrollArea, QPushButton,
     QLineEdit, QTextEdit, QMessageBox, QGridLayout, QSplitter,
-    QFileDialog
+    QFileDialog, QRadioButton, QAbstractItemView, QButtonGroup
 )
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QStandardItemModel, QStandardItem
+from PySide6.QtCore import Qt, QItemSelectionModel, QItemSelection
+import ctypes
 
 class SteamShortcutsEditor(QMainWindow):
     def __init__(self):
@@ -23,14 +25,14 @@ class SteamShortcutsEditor(QMainWindow):
         self.setMinimumSize(900, 600)
         
         # Try to automatically find the shortcuts.vdf path
-        self.find_shortcuts_path()
-        
-        # Create the UI
-        self.setup_ui()
-        
+        self.enable_save = self.find_shortcuts_path()
+
         # Load the data if path exists
         if self.shortcuts_path:
             self.load_data()
+        
+        # Create the UI
+        self.setup_ui()
     
     def find_shortcuts_path(self):
         """Try to automatically locate the shortcuts.vdf file"""
@@ -61,10 +63,17 @@ class SteamShortcutsEditor(QMainWindow):
             with open(self.shortcuts_path, 'rb') as f:
                 self.data = vdf.binary_load(f)
             self.original_data = self.data.copy()  # Keep a copy for comparison
+            self.enable_save = True
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load shortcuts file: {e}")
             self.data = {"shortcuts": {}}
             self.original_data = self.data.copy()
+            self.enable_save = False
+        
+        try:
+            self.save_button.isEnabled(self.enable_save)
+        except:
+            pass
     
     def setup_ui(self):
         """Set up the main UI components"""
@@ -97,15 +106,38 @@ class SteamShortcutsEditor(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter, 1)
         
+        # Create sort options
+        self.sort_type = QButtonGroup(exclusive=True)
+        sort_id = QRadioButton("File order")
+        sort_id.setChecked(True)
+        sort_name = QRadioButton("Shortcut Name")
+        self.sort_type.addButton(sort_id, 1) # id numbers are used to map against the shortcut list model
+        self.sort_type.addButton(sort_name, 0)
+        self.sort_type.idToggled.connect(self.sort_shortcuts)
+        self.sort_order = 1
+
         # Create left panel for shortcut list
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.addWidget(QLabel("Shortcuts:"))
+        left_header_panel = QWidget()
+        left_header_layout = QHBoxLayout(left_header_panel)
+        left_header_layout.addWidget(QLabel("Shortcuts:"))
+        left_header_layout.addStretch()
+        left_header_layout.addWidget(QLabel("Sort by:"))
+        left_header_layout.addWidget(sort_id)
+        left_header_layout.addWidget(sort_name)
+
+        left_layout.addWidget(left_header_panel)
         
         # Create shortcut list
-        self.shortcut_list = QListWidget()
-        self.shortcut_list.currentRowChanged.connect(self.on_shortcut_select)
-        left_layout.addWidget(self.shortcut_list)
+        self.shortcut_list = QStandardItemModel()
+        self.shortcut_list_widget = QListView()
+        self.shortcut_list_widget.setModel(self.shortcut_list)
+        self.shortcut_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.shortcut_list_widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.shortcut_list_widget.selectionModel().selectionChanged.connect(self.on_shortcut_select)
+
+        left_layout.addWidget(self.shortcut_list_widget)
         
         # Add shortcuts to list if data is loaded
         if hasattr(self, 'data'):
@@ -126,10 +158,14 @@ class SteamShortcutsEditor(QMainWindow):
         
         # Create buttons
         buttons_layout = QHBoxLayout()
+        self.delete_button = QPushButton("Delete VDF Entry")
+        self.delete_button.clicked.connect(self.delete_entry)
+        self.delete_button.setDisabled(True)
         self.save_button = QPushButton("Save Changes")
         self.save_button.clicked.connect(self.save_changes)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_data)
+        buttons_layout.addWidget(self.delete_button)
         buttons_layout.addStretch()
         buttons_layout.addWidget(self.refresh_button)
         buttons_layout.addWidget(self.save_button)
@@ -154,15 +190,21 @@ class SteamShortcutsEditor(QMainWindow):
             self.path_edit.setText(file_path)
             self.load_data()
             self.refresh_shortcut_list()
+
+    def sort_shortcuts(self, column, checked):
+        if checked:
+            self.shortcut_list.sort(column)
+            self.sort_order = column
     
     def refresh_shortcut_list(self):
         """Refresh the shortcut list in the UI"""
         self.shortcut_list.clear()
+        self.shortcut_list.setHorizontalHeaderLabels(["Name", "File Order"])
         if hasattr(self, 'data') and 'shortcuts' in self.data:
             for shortcut_id in self.data['shortcuts']:
                 shortcut = self.data['shortcuts'][shortcut_id]
-                app_name = shortcut.get('AppName', f"Shortcut {shortcut_id}")
-                self.shortcut_list.addItem(app_name)
+                app_name = dict((k.lower(), v) for k, v in shortcut.items()).get('appname', f"Shortcut {shortcut_id}")
+                self.shortcut_list.appendRow([QStandardItem(app_name), QStandardItem(shortcut_id)])
     
     def on_shortcut_select(self, row):
         """Handle selection of a shortcut from the list"""
@@ -171,19 +213,27 @@ class SteamShortcutsEditor(QMainWindow):
             item = self.properties_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.delete_button.setDisabled(True)
         
-        if row < 0 or not hasattr(self, 'data') or 'shortcuts' not in self.data:
+        if (row.indexes()): 
+            shortcut_index = row.indexes()[0] # we ensure only a single selection is possible at construction time, so this should be sufficient
+            shortcut_item = self.shortcut_list.itemFromIndex(shortcut_index)
+        else:
+            self.current_shortcut_id = None
+            return
+        if shortcut_item.row() < 0 or not hasattr(self, 'data') or 'shortcuts' not in self.data:
             return
         
         # Get shortcut data
-        shortcut_ids = list(self.data['shortcuts'].keys())
-        if row >= len(shortcut_ids):
-            return
+        #shortcut_ids = list(self.shortcut_list.column)
+        #if shortcut_index >= len(shortcut_ids):
+        #    return
             
-        shortcut_id = shortcut_ids[row]
+        shortcut_id = self.shortcut_list.item(shortcut_item.row(), 1).text()
         shortcut = self.data['shortcuts'][shortcut_id]
         
         # Save reference to current shortcut
+        self.current_shortcut_name = self.shortcut_list.item(shortcut_item.row(), 0).text()
         self.current_shortcut_id = shortcut_id
         self.entry_widgets = {}
         
@@ -203,6 +253,10 @@ class SteamShortcutsEditor(QMainWindow):
                 # Convert to string for display
                 if isinstance(value, bytes):
                     text_value = value.decode('utf-8', errors='replace')
+                elif isinstance(value, int):
+                    #coerce value stored as unsigned in vdf but parsed as signed back into uint
+                    #This is useful because SteamRomManager saves its icon files with this uint value, and writes them into the icon field
+                    text_value = str(ctypes.c_uint32(value).value)
                 else:
                     text_value = str(value)
                     
@@ -212,6 +266,19 @@ class SteamShortcutsEditor(QMainWindow):
             self.properties_layout.addWidget(entry, row, 1)
             self.entry_widgets[key] = entry
             row += 1
+
+        self.delete_button.setDisabled(False)
+
+    def delete_entry(self):
+        try:
+            entry = self.current_shortcut_name
+            if (QMessageBox.question(self, "Warning", f"Are you sure you want to delete the entry {entry}?", defaultButton=QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes):
+                self.data['shortcuts'].pop(self.current_shortcut_id)
+                current_row = self.shortcut_list.findItems(self.current_shortcut_id, column=1)[0].row()
+                self.shortcut_list.removeRow(current_row)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed: {e}")
     
     def save_changes(self):
         """Save changes to the shortcuts.vdf file"""
